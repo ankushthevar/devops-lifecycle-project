@@ -184,12 +184,4 @@ docker run --rm -v $PWD/scripts:/scripts grafana/k6 run /scripts/load-test.js \
 
 **Why `--atomic` in Helm?** If any K8s resource fails to reach `Ready` within the timeout, Helm automatically rolls back to the previous release. This makes every deploy safe to run without a human watching.
 
----
 
-## Resume Talking Points
-
-- Implemented **DevSecOps pipeline** with secret detection (Gitleaks), SAST (Semgrep), and container CVE scanning (Trivy) — zero CRITICAL CVEs in production images
-- Designed **multi-window SLO burn-rate alerting** (Google SRE model) reducing false-positive pages by ~80% vs threshold-only alerts  
-- Built **IRSA-based IAM** for all EKS workloads, eliminating long-lived AWS credentials from all 12 microservices
-- Achieved **99.95% availability** using K8s HPA, PodDisruptionBudgets, and topology spread constraints
-- Provisioned **multi-environment IaC** (dev/staging/prod) with Terraform modules, remote state locking, and Checkov policy enforcement
