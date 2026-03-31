@@ -1,0 +1,186 @@
+# monitoring/alerts/slo-alerts.yaml
+# SLO-based alerting rules — burns down error budget windows
+# These implement multi-window, multi-burn-rate alerting per the Google SRE Book.
+#
+# SLO targets:
+#   Availability: 99.9% (43.8 min downtime/month)
+#   Latency P99:  < 500ms for 95% of requests
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: myapp-slo-alerts
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+
+    # ── Availability SLO (99.9%) ────────────────────────────────────────────
+    - name: myapp.slo.availability
+      interval: 1m
+      rules:
+        # Error ratio recording rules (fast lookup for burn rate calc)
+        - record: job:myapp_error_ratio:rate5m
+          expr: |
+            sum(rate(http_requests_total{job="myapp", status_code=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="myapp"}[5m]))
+
+        - record: job:myapp_error_ratio:rate1h
+          expr: |
+            sum(rate(http_requests_total{job="myapp", status_code=~"5.."}[1h]))
+            /
+            sum(rate(http_requests_total{job="myapp"}[1h]))
+
+        - record: job:myapp_error_ratio:rate6h
+          expr: |
+            sum(rate(http_requests_total{job="myapp", status_code=~"5.."}[6h]))
+            /
+            sum(rate(http_requests_total{job="myapp"}[6h]))
+
+        # Fast burn: consuming 14.4× the error budget → page NOW
+        # Will exhaust the monthly budget in ~2 hours
+        - alert: MyAppHighErrorBurnRate
+          expr: |
+            job:myapp_error_ratio:rate5m > (14.4 * 0.001)
+            and
+            job:myapp_error_ratio:rate1h > (14.4 * 0.001)
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            slo: availability
+          annotations:
+            summary: "High error burn rate — SLO at risk"
+            description: |
+              Error rate is burning through the availability budget at 14.4×.
+              Current 5m error ratio: {{ $value | humanizePercentage }}.
+              At this rate, the monthly error budget will be exhausted in ~2 hours.
+            runbook_url: "https://runbooks.internal/myapp/high-error-rate"
+            dashboard_url: "https://grafana.internal/d/myapp-slo"
+
+        # Slow burn: 6× burn rate over 6h → warn (budget will last ~5 days)
+        - alert: MyAppSlowErrorBurnRate
+          expr: |
+            job:myapp_error_ratio:rate1h > (6 * 0.001)
+            and
+            job:myapp_error_ratio:rate6h > (6 * 0.001)
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            slo: availability
+          annotations:
+            summary: "Elevated error rate — SLO degrading slowly"
+            description: |
+              Error rate is burning at 6× the budget. 
+              Current 1h error ratio: {{ $value | humanizePercentage }}.
+            runbook_url: "https://runbooks.internal/myapp/elevated-error-rate"
+
+    # ── Latency SLO (P99 < 500ms for 95% of requests) ──────────────────────
+    - name: myapp.slo.latency
+      rules:
+        - record: job:myapp_latency_p99:rate5m
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{job="myapp"}[5m])) by (le)
+            )
+
+        - alert: MyAppLatencyP99High
+          expr: job:myapp_latency_p99:rate5m > 0.5
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+            slo: latency
+          annotations:
+            summary: "P99 latency exceeds SLO threshold"
+            description: |
+              P99 request latency is {{ $value | humanizeDuration }}, above the 500ms SLO target.
+            runbook_url: "https://runbooks.internal/myapp/high-latency"
+
+    # ── Infrastructure Alerts ───────────────────────────────────────────────
+    - name: myapp.infrastructure
+      rules:
+        - alert: MyAppPodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{
+              namespace="myapp",
+              container="myapp"
+            }[15m]) * 60 * 15 > 3
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Pod crash-looping in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: |
+              Pod {{ $labels.pod }} has restarted {{ $value | humanize }} times in 15 minutes.
+            runbook_url: "https://runbooks.internal/myapp/pod-crash-loop"
+
+        - alert: MyAppHPAMaxedOut
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas{
+              namespace="myapp",
+              horizontalpodautoscaler="myapp"
+            }
+            >=
+            kube_horizontalpodautoscaler_spec_max_replicas{
+              namespace="myapp",
+              horizontalpodautoscaler="myapp"
+            }
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "HPA at maximum replicas — consider scaling limits"
+            description: |
+              The HPA has been at its max replica count for 10 minutes.
+              This may indicate the app needs more capacity headroom.
+
+        - alert: MyAppDependencyDown
+          expr: dependency_up{job="myapp"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Dependency '{{ $labels.dependency }}' is down"
+            description: |
+              The readiness probe reports {{ $labels.dependency }} as unreachable.
+              Pods will be removed from the load balancer until it recovers.
+
+        - alert: MyAppCertExpiringSoon
+          expr: |
+            (x509_cert_expiry{namespace="myapp"} - time()) / 86400 < 14
+          for: 1h
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "TLS certificate expiring in {{ $value | humanize }} days"
+            description: |
+              The certificate for {{ $labels.secret }} expires in {{ $value }} days.
+              cert-manager should auto-renew — check cert-manager logs if this alert persists.
+
+    # ── FinOps / Cost Alerts ────────────────────────────────────────────────
+    - name: myapp.finops
+      rules:
+        - alert: MyAppIdleNodeGroupDetected
+          expr: |
+            sum(kube_node_status_allocatable{resource="cpu"}) by (node)
+            -
+            sum(kube_pod_container_resource_requests{resource="cpu"}) by (node)
+            > 1.5   # more than 1.5 vCPU unallocated per node for 2h
+          for: 2h
+          labels:
+            severity: info
+            team: finops
+          annotations:
+            summary: "Node {{ $labels.node }} has excess CPU capacity"
+            description: |
+              Node {{ $labels.node }} has been underutilised for 2 hours.
+              Consider enabling Spot instances or adjusting node group sizing.

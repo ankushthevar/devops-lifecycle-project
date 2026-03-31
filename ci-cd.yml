@@ -1,0 +1,357 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [dev, staging, prod]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  TERRAFORM_VERSION: "1.7.0"
+  HELM_VERSION: "3.14.0"
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  id-token: write  # for OIDC auth with AWS
+
+jobs:
+  # ─────────────────────────────────────────
+  # STAGE 1: Code Quality & Static Analysis
+  # ─────────────────────────────────────────
+  lint-and-test:
+    name: "Lint & Unit Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for SonarCloud
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt -r app/requirements-dev.txt
+
+      - name: Run linter (Ruff)
+        run: ruff check app/src --output-format=github
+
+      - name: Run type checker (mypy)
+        run: mypy app/src --ignore-missing-imports
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest app/tests/unit \
+            --cov=app/src \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --junitxml=reports/unit-tests.xml \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: reports/
+
+  # ─────────────────────────────────────────
+  # STAGE 2: Security Scanning (DevSecOps)
+  # ─────────────────────────────────────────
+  security-scan:
+    name: "Security Scanning"
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secret detection (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: SAST scan (Semgrep)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/python
+            p/owasp-top-ten
+            p/secrets
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Dependency vulnerability check (Safety)
+        run: |
+          pip install safety
+          safety check -r app/requirements.txt \
+            --output json \
+            --save-json reports/safety-report.json || true
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+  # ─────────────────────────────────────────
+  # STAGE 3: Build & Push Docker Image
+  # ─────────────────────────────────────────
+  build-and-push:
+    name: "Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: security-scan
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true   # SLSA provenance attestation
+          sbom: true         # Software Bill of Materials
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"      # fail pipeline on CRITICAL/HIGH CVEs
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ─────────────────────────────────────────
+  # STAGE 4: Terraform Plan (IaC)
+  # ─────────────────────────────────────────
+  terraform-plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    env:
+      TF_ENV: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive terraform/
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ env.TF_ENV }}
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: terraform/environments/${{ env.TF_ENV }}
+        run: terraform validate
+
+      - name: Run Checkov (policy-as-code)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: sarif
+          output_file_path: reports/checkov.sarif
+          soft_fail: false
+
+      - name: Terraform Plan
+        working-directory: terraform/environments/${{ env.TF_ENV }}
+        run: |
+          terraform plan \
+            -var="image_tag=${{ needs.build-and-push.outputs.image-tag }}" \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan.txt
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/environments/${{ env.TF_ENV }}/plan.txt', 'utf8');
+            const body = `## Terraform Plan — \`${{ env.TF_ENV }}\`\n\`\`\`hcl\n${plan.slice(0, 65000)}\n\`\`\``;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  # ─────────────────────────────────────────
+  # STAGE 5: Deploy to Kubernetes
+  # ─────────────────────────────────────────
+  deploy:
+    name: "Deploy — ${{ github.event.inputs.environment || 'staging' }}"
+    runs-on: ubuntu-latest
+    needs: [build-and-push, terraform-plan]
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+      url: https://${{ github.event.inputs.environment || 'staging' }}.myapp.example.com
+    concurrency:
+      group: deploy-${{ github.event.inputs.environment || 'staging' }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Setup kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ap-south-1 \
+            --name myapp-${{ github.event.inputs.environment || 'staging' }}-cluster
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Add Helm repos
+        run: |
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo add cert-manager https://charts.jetstack.io
+          helm repo update
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install myapp helm/charts/app \
+            --namespace myapp \
+            --create-namespace \
+            --values helm/charts/app/values.yaml \
+            --values helm/charts/app/values-${{ github.event.inputs.environment || 'staging' }}.yaml \
+            --set image.tag=${{ needs.build-and-push.outputs.image-tag }} \
+            --set image.digest=${{ needs.build-and-push.outputs.image-digest }} \
+            --set environment=${{ github.event.inputs.environment || 'staging' }} \
+            --wait \
+            --timeout 10m \
+            --atomic              # rollback on failure
+            --history-max 5
+
+      - name: Run smoke tests
+        run: |
+          BASE_URL="https://${{ github.event.inputs.environment || 'staging' }}.myapp.example.com"
+          echo "Running smoke tests against $BASE_URL"
+          bash scripts/smoke-tests.sh "$BASE_URL"
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOY_CHANNEL }}
+          slack-message: |
+            ✅ *Deployed* `${{ github.repository }}` to *${{ github.event.inputs.environment || 'staging' }}*
+            Image: `${{ needs.build-and-push.outputs.image-tag }}`
+            Actor: `${{ github.actor }}`
+            Commit: ${{ github.sha }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_DEPLOY_CHANNEL }}
+          slack-message: |
+            ❌ *Deploy FAILED* `${{ github.repository }}` → *${{ github.event.inputs.environment || 'staging' }}*
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  # ─────────────────────────────────────────
+  # STAGE 6: Post-Deploy Validation
+  # ─────────────────────────────────────────
+  post-deploy:
+    name: "Post-Deploy Validation"
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run integration tests
+        run: |
+          BASE_URL="https://${{ github.event.inputs.environment || 'staging' }}.myapp.example.com"
+          pytest app/tests/integration \
+            --base-url="$BASE_URL" \
+            --junitxml=reports/integration-tests.xml
+
+      - name: Performance baseline check (k6)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/scripts:/scripts \
+            grafana/k6 run /scripts/load-test.js \
+            --env BASE_URL="https://${{ github.event.inputs.environment || 'staging' }}.myapp.example.com"
+
+      - name: Verify observability is active
+        run: bash scripts/verify-metrics.sh
