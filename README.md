@@ -2,7 +2,7 @@
 
 > A production-grade reference project demonstrating the **complete DevOps lifecycle** — from code commit to SLO monitoring — with real tooling and zero cutting of corners.
 
-[![CI/CD](https://github.com/yourorg/devops-lifecycle-project/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/yourorg/devops-lifecycle-project/actions)
+![CI](https://github.com/ankushthevar/devops-lifecycle-project/actions/workflows/ci-cd.yml/badge.svg)
 [![Security Scan](https://img.shields.io/badge/security-semgrep%20%7C%20trivy%20%7C%20gitleaks-blue)](./docs/security.md)
 [![Infrastructure](https://img.shields.io/badge/infra-terraform%20%7C%20eks%20%7C%20helm-purple)](./terraform)
 [![Observability](https://img.shields.io/badge/observability-prometheus%20%7C%20grafana%20%7C%20loki-orange)](./monitoring)
