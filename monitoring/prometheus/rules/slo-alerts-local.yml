@@ -1,0 +1,41 @@
+groups:
+  - name: myapp.availability
+    interval: 30s
+    rules:
+      - record: job:myapp_error_ratio:rate5m
+        expr: |
+          sum(rate(http_requests_total{job="myapp", status_code=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total{job="myapp"}[5m]))
+
+      - alert: MyAppHighErrorRate
+        expr: job:myapp_error_ratio:rate5m > 0.01
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value | humanizePercentage }}"
+
+      - alert: MyAppDown
+        expr: up{job="myapp"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "App is down"
+          description: "The app has been unreachable for 30 seconds"
+
+  - name: myapp.latency
+    rules:
+      - alert: MyAppHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{job="myapp"}[5m])) by (le)
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P99 latency above 500ms"
+          description: "P99 latency is {{ $value | humanizeDuration }}"
