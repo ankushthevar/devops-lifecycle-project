@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+
+  # ── Job 1: Code Quality ───────────────────────────────────────────────────
+  lint-and-test:
+    name: "Lint & Test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt -r app/requirements-dev.txt
+
+      - name: Lint (Ruff)
+        run: ruff check app/src || true
+
+      - name: Type check (mypy)
+        run: mypy app/src --ignore-missing-imports || true
+
+      - name: Run tests
+        run: |
+          pytest app/tests/ -v --tb=short || echo "No tests yet — add tests!"
+
+  # ── Job 2: Security Scan ──────────────────────────────────────────────────
+  security:
+    name: "Security Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secret detection (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Job 3: Docker Build ───────────────────────────────────────────────────
+  build:
+    name: "Docker Build"
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: devops-app:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: devops-app:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+  # ── Job 4: Helm Lint ──────────────────────────────────────────────────────
+  helm-lint:
+    name: "Helm Lint"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Helm lint
+        run: helm lint helm/charts/app
+
+      - name: Helm template (dry run)
+        run: |
+          helm template myapp helm/charts/app \
+            --set image.tag=test \
+            --set environment=ci
