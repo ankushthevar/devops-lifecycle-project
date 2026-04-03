@@ -3,7 +3,7 @@ image:
   tag: local
   pullPolicy: Never
 
-replicaCount: 2
+replicaCount: 3
 
 environment: dev
 
